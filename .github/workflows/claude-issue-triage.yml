@@ -1,0 +1,99 @@
+name: Claude Issue Triage
+
+on:
+  issues:
+    types: [opened, edited]
+
+# Cancela runs previos del mismo issue si llegan ediciones seguidas.
+concurrency:
+  group: issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    # - Ignora ediciones hechas por bots (evita bucles).
+    # - Si el issue menciona @claude, lo maneja claude.yml, no el triage.
+    # - En 'edited' solo re-analiza cuando cambió el CUERPO del issue
+    #   (github.event.changes.body solo viene presente si la descripción cambió).
+    if: >
+      github.event.sender.type != 'Bot' &&
+      !contains(github.event.issue.body, '@claude') &&
+      !contains(github.event.issue.title, '@claude') &&
+      (github.event.action == 'opened' || github.event.changes.body != null)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Triage del issue con Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }} # autentica las llamadas Bash(gh ...)
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >
+            --allowedTools "Bash(gh label list),Bash(gh label list:*),Bash(gh label create:*),Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh search:*)"
+          prompt: |
+            Eres el clasificador (triage) automático de issues del repositorio de un
+            Tetris en JavaScript vanilla con HTML5 Canvas. Toda la lógica del juego vive
+            en `game.js` (~300 líneas, sin clases). Consulta `CLAUDE.md` y `README.md` del
+            repo para entender la arquitectura antes de diagnosticar.
+
+            CONTEXTO DEL EVENTO
+            - REPO: ${{ github.repository }}
+            - ISSUE: #${{ github.event.issue.number }}
+            - ACCIÓN: ${{ github.event.action }}
+            - TÍTULO: ${{ github.event.issue.title }}
+            - AUTOR: ${{ github.event.issue.user.login }}
+            - CUERPO:
+            ${{ github.event.issue.body }}
+
+            TAREAS
+            1. Ejecuta `gh label list` para ver los labels existentes.
+            2. Clasifica el issue con TRES ejes:
+               - Tipo: uno de `bug`, `enhancement`, `question`, `documentation`.
+               - Prioridad: uno de `priority:critical`, `priority:high`,
+                 `priority:medium`, `priority:low`.
+               - Área(s) afectada(s) del juego (0..n): `area:board`, `area:pieces`,
+                 `area:collision`, `area:game-loop`, `area:scoring`, `area:rendering`,
+                 `area:ui`, `area:input`. Basa esto en la arquitectura de `game.js`
+                 (`board`, `PIECES`/`COLORS`, `collide`, `tryRotate`, `loop`,
+                 `lockPiece` → `merge` → `clearLines` → `spawn`, `LINE_SCORES`, etc.).
+            3. Para cada label que NO exista todavía, créalo:
+               `gh label create "<nombre>" --description "<breve>" --color <hex>`
+               (sugerencia de colores: bug=d73a4a, enhancement=a2eeef, question=d876e3,
+               documentation=0075ca, priority:*=b60205/d93f0b/fbca04/0e8a16,
+               area:*=c5def5). Luego asígnalos todos de una vez:
+               `gh issue edit ${{ github.event.issue.number }} --add-label "a" --add-label "b" ...`
+            4. Publica UN comentario con
+               `gh issue comment ${{ github.event.issue.number }} --body "..."`
+               con el diagnóstico estructurado EN ESPAÑOL y estas secciones (Markdown):
+               - **Resumen**: reformulación breve del problema o petición.
+               - **Tipo y prioridad**: con una línea de justificación cada uno.
+               - **Componentes probablemente implicados**: archivos y funciones concretas
+                 de `game.js` (p. ej. `collide`, `tryRotate`, `lockPiece`, `clearLines`,
+                 `loop`, `spawn`, `merge`, arrays `PIECES`/`COLORS`, constantes
+                 `COLS`/`ROWS`/`BLOCK`).
+               - **Hipótesis de causa raíz** (si es bug) o **Enfoque de diseño propuesto**
+                 (si es feature/mejora).
+               - **Pasos de reproducción** (si aplica).
+               - **Invariantes / riesgos a cuidar**: p. ej. toda mutación de posición o
+                 rotación debe pasar por `collide`; `PIECES`, `COLORS` y los índices del
+                 `board` van alineados por índice; si cambian `COLS`/`ROWS`/`BLOCK` hay
+                 que ajustar `width`/`height` del `<canvas id="board">` en `index.html`;
+                 `.overlay` se comparte entre PAUSA y GAME OVER.
+               - **Propuesta de siguientes pasos** para implementar la solución.
+               - Si `${{ github.event.action }}` es `edited`, empieza el comentario con
+                 la línea: `🔄 **Diagnóstico actualizado** (el cuerpo del issue cambió)`.
+            5. NO modifiques el cuerpo del issue, NO lo cierres, NO abras PRs ni ramas.
+               Solo labels + un comentario.
+            6. Si el issue es demasiado vago para diagnosticar, aplica el label
+               `question` y usa el comentario para pedir los datos que falten
+               (pasos, comportamiento esperado vs observado, navegador).
